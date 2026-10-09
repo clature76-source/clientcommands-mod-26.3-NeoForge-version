@@ -1,0 +1,373 @@
+import net.earthcomputer.clientcommands.buildscript.CheckLanguageFilesTask
+import net.earthcomputer.clientcommands.buildscript.GenerateBuildInfoTask
+
+plugins {
+	id 'net.neoforged.moddev' version "${moddev_gradle_version}"
+	id 'maven-publish'
+	id 'checkstyle'
+}
+
+base {
+	archivesName = project.archives_base_name
+}
+
+sourceSets {
+	codeGen
+}
+
+configurations {
+	includedLibrary
+	implementation.extendsFrom includedLibrary
+	// Libraries whose classes must be owned by NeoForge's game-content classloader rather than the app
+	// classloader; see the dependency block for the failure this avoids.
+	gameContentLibrary
+}
+
+repositories {
+	maven {
+		url = 'https://maven.seedfinding.com'
+	}
+	maven {
+		url = 'https://maven.latticg.com'
+	}
+	maven {
+		url = 'https://maven.xpple.dev/maven2'
+	}
+	maven {
+		url = "https://pkgs.dev.azure.com/djtheredstoner/DevAuth/_packaging/public/maven/v1"
+	}
+	maven {
+		url = "https://maven.parchmentmc.org"
+	}
+	// Forgified Fabric API: Sinytra's NeoForge port of the Fabric API modules. This is what supplies
+	// net.neoforged.neoforge.client.ClientCommandSourceStack's FabricClientCommandSource
+	// implementation, and is why the port no longer hand-writes a Fabric compatibility layer.
+	maven {
+		name = 'ForgifiedFabricApi'
+		url = 'https://maven.su5ed.dev/releases'
+	}
+}
+
+neoForge {
+	version = project.neoforge_version
+
+	// NeoForm prints the resolved compile classpath only in verbose mode. That listing is what makes a
+	// library-version conflict inside the Minecraft source recompile diagnosable, so it is on by
+	// default; it costs a few lines of build output.
+	neoFormRuntime {
+		verbose = true
+	}
+	// Parchment does not publish mappings for 26.x yet; official Mojang mappings are used.
+
+	// Access transformers are NeoForge's equivalent of Fabric's access wideners.
+	accessTransformers.from('src/main/resources/META-INF/accesstransformer.cfg')
+	// Validation reports AT entries that do not resolve against the mapped Minecraft jar, which is
+	// the only way a silently-ignored transformer becomes visible.
+	validateAccessTransformers = true
+
+	runs {
+		client {
+			client()
+			gameDirectory = file('run')
+			jvmArguments.add('-Ddevauth.enabled=true')
+			// Optional: auto-join a world so login-time paths (client command registration, player
+			// join events) are exercised. Enable with -PquickPlayWorld="<save name>".
+			if (project.hasProperty('quickPlayWorld')) {
+				programArguments.addAll('--quickPlaySingleplayer', project.property('quickPlayWorld').toString())
+			}
+
+			// --- Mixin verification (opt-in via -PverifyMixins) -------------------------------
+			// Mixin is silent about successful applications. These flags turn "no error was
+			// printed" into a positive record of which mixins actually applied, which is what
+			// `verify-mixins.ps1` cross-references against the mixin config.
+			if (project.hasProperty('verifyMixins')) {
+				jvmArguments.add('-Dmixin.debug.verbose=true')
+				jvmArguments.add('-Dmixin.checks=true')
+				jvmArguments.add('-Dmixin.debug.countInjections=true')
+				// Enables the mod's own /cauditmixins command outside a dev environment.
+				jvmArguments.add('-Dclientcommands.enableAuditMixins=true')
+				// Force-loads mixin targets a startup-only run never reaches (screens/menus).
+				jvmArguments.add('-Dclientcommands.verifyMixinTargets=true')
+			}
+		}
+	}
+
+	mods {
+		clientcommands {
+			sourceSet sourceSets.main
+		}
+	}
+}
+
+dependencies {
+	// NeoForge itself is provided by the neoForge extension above.
+
+	// Fastutil version guard.
+	//
+	// NeoForm recompiles Minecraft's own sources as part of `createMinecraftArtifacts`, and it builds
+	// that compile classpath from the `neoform-runtime` tool dependencies as well as Minecraft's own.
+	// `neoform-runtime` -> `io.codechicken:DiffPatch` declares fastutil 8.3.1, which then lands on the
+	// same classpath as Minecraft's own fastutil 8.5.18. 8.3.1 comes first and wins, so Minecraft's
+	// sources fail to compile against it:
+	//
+	//   ERROR: NormalNoise.java:138 cannot find symbol: method of(double[])
+	//     location: interface it.unimi.dsi.fastutil.doubles.DoubleList
+	//
+	// (8.3.1 has no IntList.of/LongSet.longStream/LongOpenHashSet.toSet; 8.5.18 does.)
+	//
+	// Gson has the same problem for the same reason: the tool dependencies pin 2.10.1 while Minecraft
+	// 26.3's sources call JsonReader.setStrictness(Strictness), which only exists from 2.11.
+	//
+	//   ERROR: GsonHelper.java:432 cannot find symbol: method setStrictness(com.google.gson.Strictness)
+	//
+	// Pinning the versions here forces the whole graph -- tool dependencies included -- onto the
+	// versions Minecraft actually targets.
+	configurations.configureEach {
+		resolutionStrategy {
+			force "it.unimi.dsi:fastutil:${project.fastutil_version}"
+			force "com.google.code.gson:gson:${project.gson_version}"
+		}
+	}
+
+	// Third-party libraries vendored into the jar (jar-in-jar equivalent below).
+	includedLibrary "com.seedfinding:mc_feature:${project.seedfinding_feature_version}"
+	includedLibrary "com.seedfinding:mc_biome:${project.seedfinding_biome_version}"
+	includedLibrary "com.seedfinding:mc_core:${project.seedfinding_core_version}"
+	includedLibrary "com.seedfinding:mc_seed:${project.seedfinding_seed_version}"
+
+	includedLibrary "com.seedfinding:latticg:${project.latticg_version}:rt"
+	codeGenImplementation "com.seedfinding:latticg:${project.latticg_version}"
+
+	codeGenImplementation "org.jspecify:jspecify:1.0.0"
+
+	compileOnly 'com.demonwav.mcdev:annotations:2.0.0'
+
+	// Forgified Fabric API: Sinytra's NeoForge port of the Fabric API modules. NeoForge itself ships
+	// net.neoforged.neoforge.client.ClientCommandSourceStack (a CommandSourceStack subclass) and the
+	// Forgified command API makes it implement FabricClientCommandSource. That single class is the
+	// bridge between the two worlds, so the mod uses the real Fabric API types instead of the
+	// hand-written shims it needed before.
+	//
+	// These are real NeoForge mods: each ships its own META-INF/neoforge.mods.toml declaring a mod id
+	// (fabric_api_base, fabric_command_api_v2, ...) and its own mixin config. They must therefore stay
+	// intact as nested jars rather than having their classes unpacked into this mod.
+	//
+	// Unpacking them was the earlier mistake: the entrypoint class (BaseModInitializer) ended up in
+	// this jar while the mods.toml that declares it did not, so NeoForge aborted startup with
+	//
+	//   File mods/clientcommands-...jar contains mod entrypoint class
+	//   net.fabricmc.fabric.impl.base.BaseModInitializer for mod with id fabric_api_base,
+	//   which does not exist or is not in the same file.
+	//
+	// jarJar keeps each artifact whole, so NeoForge discovers and loads them as the mods they are.
+	// They are still `compileOnly` here because their classes come from the nested jars at runtime.
+	compileOnly("org.sinytra.forgified-fabric-api:fabric-api-base:${project.ffapi_api_base}") {
+		transitive = false
+	}
+	compileOnly("org.sinytra.forgified-fabric-api:fabric-command-api-v2:${project.ffapi_command_api_v2}") {
+		transitive = false
+	}
+	compileOnly("org.sinytra:forgified-fabric-loader:${project.forgified_loader_version}") {
+		transitive = false
+	}
+	jarJar("org.sinytra.forgified-fabric-api:fabric-api-base:${project.ffapi_api_base}") {
+		transitive = false
+	}
+	jarJar("org.sinytra.forgified-fabric-api:fabric-command-api-v2:${project.ffapi_command_api_v2}") {
+		transitive = false
+	}
+	jarJar("org.sinytra:forgified-fabric-loader:${project.forgified_loader_version}") {
+		transitive = false
+	}
+
+	// Third-party libraries the mod builds on. These are Fabric-targeted artifacts; the port
+	// consumes them for their vanilla-Brigadier argument types and config API.
+	//
+	// Their POMs declare Fabric loader + Fabric API as <scope>runtime</scope> dependencies. Those
+	// must NOT reach the classpath here: the Fabric API surface is provided by the Forgified modules
+	// above, so pulling the Fabric originals in would be wrong at runtime alongside NeoForge.
+	// Exclude them; keep only the xpple code itself.
+	//
+	// Loading these as plain `implementation` dependencies breaks them at runtime on NeoForge. A
+	// plain dependency is loaded by the *app* classloader, which can also see the raw, untransformed
+	// Minecraft jar. When such a library resolves a vanilla type it therefore gets a second
+	// definition of it, distinct from the one NeoForge's transforming loader produced, and the JVM
+	// rejects the linkage:
+	//
+	//   LinkageError: loader constraint violation: loader 'app' wants to load interface
+	//   net.minecraft.commands.CommandBuildContext. A different interface with the same name was
+	//   previously loaded by 'TRANSFORMER'
+	//   ...
+	//   IncompatibleClassChangeError: Class net.minecraft.commands.CommandBuildContext$1 does not
+	//   implement the requested interface net.minecraft.core.HolderLookup$Provider
+	//
+	// That surfaced as 9 commands failing to register (`/calcstack`, `/cgive`, `/creativetab`,
+	// `/ctellraw`, `/ctitle`, `/finditem`, `/ghostblock`, `/pos`, `/tooltip`).
+	//
+	// The fix is to make NeoForge's game-content classloader own these classes. They are compiled
+	// against via `compileOnly` and copied into the mod's own source-set output by `unpackGameContent`
+	// (see below), which is what both `runClient` and the built jar consume.
+	compileOnly("dev.xpple:clientarguments:${project.clientarguments_version}") {
+		exclude group: 'net.fabricmc'
+		exclude group: 'net.fabricmc.fabric-api'
+	}
+	compileOnly("dev.xpple:betterconfig-fabric:${project.betterconfig_version}") {
+		exclude group: 'net.fabricmc'
+		exclude group: 'net.fabricmc.fabric-api'
+	}
+	compileOnly("dev.xpple:simplewaypoints:${project.simplewaypoints_version}") {
+		exclude group: 'net.fabricmc'
+		exclude group: 'net.fabricmc.fabric-api'
+	}
+	gameContentLibrary("dev.xpple:clientarguments:${project.clientarguments_version}") {
+		exclude group: 'net.fabricmc'
+		exclude group: 'net.fabricmc.fabric-api'
+	}
+	gameContentLibrary("dev.xpple:betterconfig-fabric:${project.betterconfig_version}") {
+		exclude group: 'net.fabricmc'
+		exclude group: 'net.fabricmc.fabric-api'
+	}
+	gameContentLibrary("dev.xpple:simplewaypoints:${project.simplewaypoints_version}") {
+		exclude group: 'net.fabricmc'
+		exclude group: 'net.fabricmc.fabric-api'
+	}
+
+	codeGenImplementation sourceSets.main.output
+
+	testImplementation "org.junit.jupiter:junit-jupiter:${project.junit_version}"
+	testImplementation "com.code-intelligence:jazzer-junit:${project.jazzer_junit_version}"
+}
+
+checkstyle {
+	toolVersion = project.checkstyle_version
+	configFile = rootProject.file("checkstyle.xml")
+	ignoreFailures = false
+}
+
+test {
+	useJUnitPlatform()
+	systemProperty('clientcommands.regressionTestDir', file('regressionTests').absolutePath)
+}
+
+// NeoForge's game-content classloader is built from the mod's own classes/resources directories, so
+// unpacking these libraries into the compiled output puts them there. That is what makes the same
+// code work in a `runClient` invocation and in the built jar, and it keeps exactly one definition of
+// each vanilla type in play (see the dependency block for the linkage failure otherwise).
+tasks.register('unpackGameContent', Copy) {
+	// Depends on compileJava (not `classes`) to avoid a cycle: processResources already depends on
+	// this task, and `classes` depends on processResources.
+	dependsOn 'compileJava'
+	from(configurations.gameContentLibrary.collect { it.isDirectory() ? it : zipTree(it) }) {
+		include 'dev/xpple/**'
+		// The xpple libraries are Fabric mods whose behaviour is partly delivered through mixins
+		// (betterconfig.mixins.json, betterconfig.mixins.client.json, mixins.simplewaypoints.json).
+		// Their fabric.mod.json -- which normally points Mixin at those configs -- is excluded below,
+		// because NeoForge ignores it and a stray Fabric descriptor confuses mod discovery. The configs
+		// themselves must therefore be merged in and declared explicitly in META-INF/neoforge.mods.toml;
+		// without that the libraries load but their mixins silently never apply.
+		include 'betterconfig.mixins.json'
+		include 'betterconfig.mixins.client.json'
+		include 'mixins.simplewaypoints.json'
+		// Assets referenced by the configs above (betterconfig ships its own lang files and icon).
+		include 'assets/betterconfig/**'
+		include 'assets/simplewaypoints/**'
+		// ServiceLoader registrations are required (betterconfig locates its platform implementation
+		// through META-INF/services), so META-INF/services is kept while the rest of META-INF is not:
+		// a stray mods.toml or MANIFEST would confuse NeoForge's mod discovery.
+		include 'META-INF/services/**'
+		exclude 'fabric.mod.json'
+		exclude 'META-INF/MANIFEST.MF'
+		// simplewaypoints nests betterconfig and clientarguments; both are declared as dependencies here,
+		// so keeping these would load each library twice.
+		exclude 'META-INF/jars/**'
+		exclude '**/*.accesswidener'
+	}
+	into layout.buildDirectory.dir('classes/java/main')
+	duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+tasks.named('processResources') { dependsOn 'unpackGameContent' }
+
+// Keep the same behaviour as the Fabric build: shade the seedfinding classes into the jar.
+jar {
+	dependsOn 'unpackGameContent'
+
+	from(configurations.includedLibrary.collect { it.isDirectory() ? it : zipTree(it) }) {
+		include 'com/seedfinding/**'
+	}
+
+	from("LICENSE")
+
+	manifest.attributes 'Main-Class': 'net.earthcomputer.clientcommands.DoubleClickMain'
+}
+
+tasks.register('generateBuildInfo', GenerateBuildInfoTask) {
+	outputFile = new File(temporaryDir, "build_info.json")
+}
+
+processResources {
+	inputs.property "version", project.version
+	inputs.property "mcversion", project.minecraft_version_dependency
+
+	duplicatesStrategy DuplicatesStrategy.WARN
+
+	from(sourceSets.main.resources.srcDirs) {
+		include "META-INF/neoforge.mods.toml"
+		expand "version": project.version, "mcversion": project.minecraft_version_dependency
+	}
+
+	from(sourceSets.main.resources.srcDirs) {
+		exclude "META-INF/neoforge.mods.toml"
+	}
+
+	from generateBuildInfo
+}
+
+java {
+	sourceCompatibility = JavaVersion.VERSION_25
+	targetCompatibility = JavaVersion.VERSION_25
+}
+
+// ModDevGradle's asset and run tasks resolve a Java executable through the project toolchain;
+// declaring it explicitly avoids "Failed to calculate the value of ... javaExecutable".
+java {
+	toolchain {
+		languageVersion = JavaLanguageVersion.of(25)
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	options.encoding = "UTF-8"
+	options.release = 25
+}
+
+tasks.register('sourcesJar', Jar) {
+	dependsOn classes
+	archiveClassifier.set("sources")
+	from sourceSets.main.allSource
+}
+
+tasks.register('codeGen', JavaExec) {
+	mainClass = 'net.earthcomputer.clientcommands.codegen.CodeGenerator'
+	classpath = sourceSets.codeGen.runtimeClasspath
+	args file('src/main/java').absolutePath
+	enableAssertions = true
+}
+
+tasks.register('checkLanguageFiles', CheckLanguageFilesTask) {
+	inputDir.set(file('src/main/resources/assets/clientcommands/lang'))
+}
+check.dependsOn checkLanguageFiles
+
+publishing {
+	publications {
+		mavenJava(MavenPublication) {
+			artifact jar
+			artifact sourcesJar
+		}
+	}
+
+	repositories {
+		// mavenLocal()
+	}
+}

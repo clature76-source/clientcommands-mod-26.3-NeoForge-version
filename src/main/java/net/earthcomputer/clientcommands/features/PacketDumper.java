@@ -1,0 +1,573 @@
+package net.earthcomputer.clientcommands.features;
+
+import com.google.gson.Gson;
+import com.google.gson.stream.JsonWriter;
+import com.mojang.datafixers.util.Either;
+import com.mojang.serialization.Codec;
+import com.mojang.serialization.DynamicOps;
+import com.mojang.serialization.JsonOps;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelPipeline;
+import io.netty.handler.codec.EncoderException;
+import it.unimi.dsi.fastutil.ints.IntList;
+import net.earthcomputer.clientcommands.c2c.C2CPacketHandler;
+import net.earthcomputer.clientcommands.c2c.C2CPacketListener;
+import net.minecraft.client.Minecraft;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.GlobalPos;
+import net.minecraft.nbt.Tag;
+import net.minecraft.network.FriendlyByteBuf;
+import net.minecraft.network.PacketDecoder;
+import net.minecraft.network.PacketEncoder;
+import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.network.codec.StreamEncoder;
+import net.minecraft.network.protocol.Packet;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.phys.BlockHitResult;
+import org.apache.commons.io.function.IOBiConsumer;
+import org.apache.commons.io.function.IORunnable;
+import org.apache.commons.io.function.IOStream;
+import org.apache.commons.io.function.Uncheck;
+import org.joml.Quaternionf;
+import org.joml.Vector3f;
+import org.jspecify.annotations.Nullable;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.ScatteringByteChannel;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.security.PublicKey;
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
+import java.time.Instant;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.BitSet;
+import java.util.Collection;
+import java.util.EnumSet;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.function.ToIntFunction;
+
+/**
+ * @author Gaming32
+ */
+public class PacketDumper {
+    public static void dumpPacket(Packet<?> packet, JsonWriter writer) throws IOException {
+        writer.beginArray();
+        try {
+            if (packet.type().id().getNamespace().equals("clientcommands")) {
+                //noinspection unchecked
+                C2CPacketHandler.C2C.codec().encode(new PacketDumpByteBuf(writer), (Packet<? super C2CPacketListener>) packet);
+            } else {
+                ChannelPipeline pipeline = Minecraft.getInstance().getConnection().getConnection().channel.pipeline();
+                @SuppressWarnings("unchecked")
+                StreamCodec<ByteBuf, Packet<?>> codec = switch (packet.type().flow()) {
+                    case CLIENTBOUND -> (StreamCodec<ByteBuf, Packet<?>>) ((PacketDecoder<?>) pipeline.get("decoder")).protocolInfo.codec();
+                    case SERVERBOUND -> (StreamCodec<ByteBuf, Packet<?>>) ((PacketEncoder<?>) pipeline.get("encoder")).protocolInfo.codec();
+                };
+                codec.encode(new PacketDumpByteBuf(writer), packet);
+            }
+        } catch (UncheckedIOException e) {
+            throw e.getCause();
+        }
+        writer.endArray();
+    }
+
+    private static class PacketDumpByteBuf extends FriendlyByteBuf {
+        private static final Gson GSON = new Gson();
+        private static final DateFormat ISO_8601 = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm'Z'");
+
+        private final JsonWriter writer;
+
+        public PacketDumpByteBuf(JsonWriter writer) {
+            super(Unpooled.buffer(0, 0)); // Uses singleton EmptyByteBuf
+            this.writer = writer;
+        }
+
+        @Override
+        @SuppressWarnings("deprecation")
+        public <T> PacketDumpByteBuf writeWithCodec(DynamicOps<Tag> ops, Codec<T> codec, T value) {
+            return dump("withCodec", () -> {
+                dumpValueClass(value);
+                writer.name("value").value(Objects.toString(value));
+                writer.name("encodedNbt").value(
+                    codec.encodeStart(ops, value).getOrThrow(message -> new EncoderException("Failed to encode: " + message + " " + value)).toString());
+                writer.name("encodedJson");
+                GSON.toJson(
+                    codec.encodeStart(JsonOps.INSTANCE, value).getOrThrow(message -> new EncoderException("Failed to encode: " + message + " " + value)),
+                    writer
+                );
+            });
+        }
+
+        @Override
+        public <T> void writeJsonWithCodec(Codec<T> codec, T value) {
+            dump("jsonWithCodec", () -> {
+                dumpValueClass(value);
+                writer.name("value").value(Objects.toString(value));
+                writer.name("encodedJson");
+                GSON.toJson(
+                    codec.encodeStart(JsonOps.INSTANCE, value).getOrThrow(message -> new EncoderException("Failed to encode: " + message + " " + value)),
+                    writer);
+            });
+        }
+
+        @Override
+        public <E extends Enum<E>> void writeEnumSet(EnumSet<E> enumSet, Class<E> enumClass) {
+            dump("enumSet", () -> {
+                String className = enumClass.getName().replace('.', '/');
+                className = className.substring(className.lastIndexOf('/') + 1);
+                writer.name("enumClass").value(className);
+                writer.name("size").value(enumSet.size());
+                writer.name("elements").beginArray();
+                for (final E element : enumSet) {
+                    writer.value(element.name());
+                }
+                writer.endArray();
+            });
+        }
+
+        @Override
+        public <T> void writeOptional(Optional<T> optional, StreamEncoder<? super FriendlyByteBuf, T> valueEncoder) {
+            writeNullable("optional", optional.orElse(null), valueEncoder);
+        }
+
+        @Override
+        public <L, R> void writeEither(Either<L, R> value, StreamEncoder<? super FriendlyByteBuf, L> leftWriter, StreamEncoder<? super FriendlyByteBuf, R> rightWriter) {
+            dump("either", () -> {
+                writer.name("left");
+                Optional<L> left = value.left();
+                if (left.isPresent()) {
+                    writer.value(true);
+                    writer.name("value");
+                    dumpValue(left.get(), leftWriter);
+                }
+                Optional<R> right = value.right();
+                if (right.isPresent()) {
+                    writer.value(false);
+                    writer.name("value");
+                    dumpValue(right.get(), rightWriter);
+                }
+            });
+        }
+
+        @Override
+        public <T> void writeNullable(@Nullable T value, StreamEncoder<? super FriendlyByteBuf, T> valueEncoder) {
+            writeNullable("nullable", value, valueEncoder);
+        }
+
+        private <T> void writeNullable(String type, @Nullable T value, StreamEncoder<? super FriendlyByteBuf, T> valueEncoder) {
+            dump(type, () -> {
+                writer.name("present");
+                if (value != null) {
+                    writer.value(true);
+                    writer.name("value");
+                    dumpValue(value, valueEncoder);
+                } else {
+                    writer.value(false);
+                }
+            });
+        }
+
+        @Override
+        public PacketDumpByteBuf writeByteArray(byte[] array) {
+            return dump("byteArray", () -> writer
+                .name("length").value(array.length)
+                .name("utf8").value(new String(array, StandardCharsets.UTF_8))
+                .name("value").value(Base64.getEncoder().encodeToString(array))
+            );
+        }
+
+        @Override
+        public PacketDumpByteBuf writeVarIntArray(int[] array) {
+            return dump("varIntArray", () -> {
+                writer.name("length").value(array.length);
+                writer.name("elements").beginArray();
+                for (final int element : array) {
+                    writer.value(element);
+                }
+                writer.endArray();
+            });
+        }
+
+        @Override
+        public PacketDumpByteBuf writeLongArray(long[] array) {
+            return dump("longArray", () -> {
+                writer.name("length").value(array.length);
+                writer.name("elements").beginArray();
+                for (final long element : array) {
+                    writer.value(element);
+                }
+                writer.endArray();
+            });
+        }
+
+        @Override
+        public FriendlyByteBuf writeFixedSizeLongArray(long[] longs) {
+            return dump("fixedSizeLongArray", () -> {
+                writer.name("elements").beginArray();
+                for (final long element : longs) {
+                    writer.value(element);
+                }
+                writer.endArray();
+            });
+        }
+
+        @Override
+        public PacketDumpByteBuf writeBlockPos(BlockPos pos) {
+            return dump("blockPos", () -> writer
+                .name("x").value(pos.getX())
+                .name("y").value(pos.getY())
+                .name("z").value(pos.getZ())
+            );
+        }
+
+        @Override
+        public PacketDumpByteBuf writeChunkPos(ChunkPos chunkPos) {
+            return dump("chunkPos", () -> writer
+                .name("x").value(chunkPos.x())
+                .name("z").value(chunkPos.z())
+            );
+        }
+
+        @Override
+        public void writeGlobalPos(GlobalPos pos) {
+            dump("globalPos", () -> writer
+                .name("level").value(pos.dimension().identifier().toString())
+                .name("x").value(pos.pos().getX())
+                .name("y").value(pos.pos().getY())
+                .name("z").value(pos.pos().getZ())
+            );
+        }
+
+        @Override
+        public void writeVector3f(Vector3f vector3f) {
+            dump("vector3f", () -> writer
+                .name("x").value(vector3f.x)
+                .name("y").value(vector3f.y)
+                .name("z").value(vector3f.z)
+            );
+        }
+
+        @Override
+        public void writeQuaternion(Quaternionf quaternion) {
+            dump("quaternion", () -> writer
+                .name("x").value(quaternion.x)
+                .name("y").value(quaternion.y)
+                .name("z").value(quaternion.z)
+                .name("w").value(quaternion.w)
+            );
+        }
+
+        @Override
+        @Deprecated
+        public PacketDumpByteBuf writeEnum(Enum<?> value) {
+            return dump("enum", () -> {
+                String className = value.getDeclaringClass().getName().replace('.', '/');
+                className = className.substring(className.lastIndexOf('/') + 1);
+                writer
+                    .name("enum").value(className)
+                    .name("value").value(value.name());
+            });
+        }
+
+        @Override
+        public <T> PacketDumpByteBuf writeById(ToIntFunction<T> idGetter, T value) {
+            return dump("byId", () -> {
+                dumpValueClass(value);
+                writer.name("value").value(Objects.toString(value));
+                writer.name("id").value(idGetter.applyAsInt(value));
+            });
+        }
+
+        @Override
+        public PacketDumpByteBuf writeUUID(UUID uuid) {
+            return dumpAsString("uuid", uuid);
+        }
+
+        @Override
+        public PacketDumpByteBuf writeVarInt(int input) {
+            return dumpSimple("varInt", input, JsonWriter::value);
+        }
+
+        @Override
+        public PacketDumpByteBuf writeVarLong(long value) {
+            return dumpSimple("varLong", value, JsonWriter::value);
+        }
+
+        @Override
+        public PacketDumpByteBuf writeNbt(@Nullable Tag tag) {
+            return dumpAsString("nbt", tag);
+        }
+
+        @Override
+        public FriendlyByteBuf writeUtf(String string) {
+            return dump("utf", () -> writer
+                .name("value").value(string)
+            );
+        }
+
+        @Override
+        public PacketDumpByteBuf writeUtf(String string, int maxLength) {
+            return dump("utf", () -> writer
+                .name("maxLength").value(maxLength)
+                .name("value").value(string)
+            );
+        }
+
+        @Override
+        public PacketDumpByteBuf writeIdentifier(Identifier resourceLocation) {
+            return dumpAsString("identifier", resourceLocation);
+        }
+
+        @Override
+        public void writeResourceKey(ResourceKey<?> resourceKey) {
+            dump("resourceKey", () -> writer
+                .name("registry").value(resourceKey.registry().toString())
+                .name("identifier").value(resourceKey.identifier().toString())
+            );
+        }
+
+        @Override
+        public void writeBitSet(BitSet bitSet) {
+            dump("bitSet", () -> {
+                writer.name("bits").beginArray();
+                IOStream.adapt(bitSet.stream().boxed()).forEach(writer::value);
+                writer.endArray();
+            });
+        }
+
+        @Override
+        public void writeFixedBitSet(BitSet bitSet, int size) {
+            dump("fixedBitSet", () -> {
+                writer.name("size").value(size);
+                writer.name("bits").beginArray();
+                IOStream.adapt(bitSet.stream().boxed()).forEach(writer::value);
+                writer.endArray();
+            });
+        }
+
+        @Override
+        public void writeContainerId(int id) {
+            dumpSimple("containerId", id, JsonWriter::value);
+        }
+
+        @Override
+        public PacketDumpByteBuf skipBytes(int length) {
+            return dump("skipBytes", () -> writer.name("length").value(length));
+        }
+
+        @Override
+        public PacketDumpByteBuf writeBoolean(boolean value) {
+            return dumpSimple("boolean", value, JsonWriter::value);
+        }
+
+        @Override
+        public PacketDumpByteBuf writeByte(int value) {
+            return dumpSimple("byte", value, JsonWriter::value);
+        }
+
+        @Override
+        public PacketDumpByteBuf writeShort(int value) {
+            return dumpSimple("short", value, JsonWriter::value);
+        }
+
+        @Override
+        public PacketDumpByteBuf writeShortLE(int value) {
+            return dumpSimple("shortLE", value, JsonWriter::value);
+        }
+
+        @Override
+        public PacketDumpByteBuf writeMedium(int value) {
+            return dumpSimple("medium", value, JsonWriter::value);
+        }
+
+        @Override
+        public PacketDumpByteBuf writeMediumLE(int value) {
+            return dumpSimple("mediumLE", value, JsonWriter::value);
+        }
+
+        @Override
+        public PacketDumpByteBuf writeInt(int value) {
+            return dumpSimple("int", value, JsonWriter::value);
+        }
+
+        @Override
+        public PacketDumpByteBuf writeIntLE(int value) {
+            return dumpSimple("intLE", value, JsonWriter::value);
+        }
+
+        @Override
+        public PacketDumpByteBuf writeLong(long value) {
+            return dumpSimple("long", value, JsonWriter::value);
+        }
+
+        @Override
+        public PacketDumpByteBuf writeLongLE(long value) {
+            return dumpSimple("longLE", value, JsonWriter::value);
+        }
+
+        @Override
+        public PacketDumpByteBuf writeChar(int value) {
+            return dumpSimple("char", Character.toString((char) value), JsonWriter::value);
+        }
+
+        @Override
+        public PacketDumpByteBuf writeFloat(float value) {
+            return dumpSimple("float", value, JsonWriter::value);
+        }
+
+        @Override
+        public PacketDumpByteBuf writeFloatLE(float value) {
+            return dumpSimple("floatLE", value, JsonWriter::value);
+        }
+
+        @Override
+        public PacketDumpByteBuf writeDouble(double value) {
+            return dumpSimple("double", value, JsonWriter::value);
+        }
+
+        @Override
+        public PacketDumpByteBuf writeDoubleLE(double value) {
+            return dumpSimple("doubleLE", value, JsonWriter::value);
+        }
+
+        @Override
+        public PacketDumpByteBuf writeBytes(ByteBuf source) {
+            return writeBytes(source, source.readableBytes());
+        }
+
+        @Override
+        public PacketDumpByteBuf writeBytes(ByteBuf source, int length) {
+            final byte[] bytes = new byte[length];
+            source.readBytes(bytes);
+            return dumpBytes(bytes);
+        }
+
+        @Override
+        public PacketDumpByteBuf writeBytes(ByteBuf source, int sourceIndex, int length) {
+            final byte[] bytes = new byte[length];
+            source.getBytes(sourceIndex, bytes);
+            return dumpBytes(bytes);
+        }
+
+        @Override
+        public PacketDumpByteBuf writeBytes(byte[] source) {
+            return dumpBytes(source);
+        }
+
+        @Override
+        public PacketDumpByteBuf writeBytes(byte[] source, int sourceIndex, int length) {
+            return dumpBytes(Arrays.copyOfRange(source, sourceIndex, sourceIndex + length));
+        }
+
+        @Override
+        public PacketDumpByteBuf writeBytes(ByteBuffer source) {
+            final byte[] bytes = new byte[source.remaining()];
+            source.get(bytes);
+            return dumpBytes(bytes);
+        }
+
+        @Override
+        public int writeBytes(InputStream inputStream, int i) throws IOException {
+            final byte[] bytes = new byte[i];
+            final int read = inputStream.read(bytes);
+            dumpBytes(Arrays.copyOf(bytes, i));
+            return read;
+        }
+
+        @Override
+        public int writeBytes(ScatteringByteChannel scatteringByteChannel, int i) throws IOException {
+            final ByteBuffer buffer = ByteBuffer.allocate(i);
+            final int read = scatteringByteChannel.read(buffer);
+            buffer.flip();
+            dumpBytes(Arrays.copyOfRange(
+                buffer.array(),
+                buffer.arrayOffset() + buffer.position(),
+                buffer.arrayOffset() + buffer.limit()
+            ));
+            return read;
+        }
+
+        @Override
+        public int writeBytes(FileChannel fileChannel, long l, int i) throws IOException {
+            return writeBytes(fileChannel.position(l), i);
+        }
+
+        private PacketDumpByteBuf dumpBytes(byte[] bytes) {
+            return dump("bytes", () -> writer
+                .name("length").value(bytes.length)
+                .name("utf8").value(new String(bytes, StandardCharsets.UTF_8))
+                .name("value").value(Base64.getEncoder().encodeToString(bytes))
+            );
+        }
+
+        @Override
+        public PacketDumpByteBuf writeZero(int length) {
+            return dump("zero", () -> writer.name("length").value(length));
+        }
+
+        @Override
+        public int writeCharSequence(CharSequence charSequence, Charset charset) {
+            final String string = charSequence.toString();
+            final byte[] encoded = string.getBytes(charset);
+            dump("charSequence", () -> writer
+                .name("charset").value(charset.name())
+                .name("value").value(string)
+                .name("encoded").value(Base64.getEncoder().encodeToString(encoded))
+            );
+            return encoded.length;
+        }
+
+        private void dumpValueClass(@Nullable Object value) throws IOException {
+            writer.name("valueClass");
+            if (value != null) {
+                String className = value.getClass().getName().replace('.', '/');
+                className = className.substring(className.lastIndexOf('/') + 1);
+                writer.value(className);
+            } else {
+                writer.nullValue();
+            }
+        }
+
+        private <T> void dumpValue(T value, StreamEncoder<? super FriendlyByteBuf, T> valueEncoder) throws IOException {
+            writer.beginObject();
+            dumpValueClass(value);
+            writer.name("fields").beginArray();
+            valueEncoder.encode(this, value);
+            writer.endArray();
+            writer.endObject();
+        }
+
+        private PacketDumpByteBuf dumpAsString(String type, @Nullable Object value) {
+            return dumpSimple(type, value != null ? value.toString() : null, JsonWriter::value);
+        }
+
+        private <T extends @Nullable Object> PacketDumpByteBuf dumpSimple(String type, T value, IOBiConsumer<JsonWriter, T> valueWriter) {
+            return dump(type, () -> {
+                writer.name("value");
+                valueWriter.accept(writer, value);
+            });
+        }
+
+        private PacketDumpByteBuf dump(String type, IORunnable dumper) {
+            Uncheck.run(() -> {
+                writer.beginObject();
+                writer.name("type").value(type);
+                dumper.run();
+                writer.endObject();
+            });
+            return this;
+        }
+    }
+}

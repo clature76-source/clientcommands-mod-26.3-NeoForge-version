@@ -1,0 +1,52 @@
+modLoader = "javafml"
+loaderVersion = "[1,)"
+license = "LGPL-3.0-or-later"
+issueTrackerURL = "https://github.com/Earthcomputer/clientcommands/issues"
+
+[[mods]]
+modId = "clientcommands"
+version = "${version}"
+displayName = "Client Commands"
+authors = "Earthcomputer"
+credits = "cortex, haykam, xpple"
+description = '''
+Useful client-side commands.
+
+Ported to NeoForge; original Fabric version by Earthcomputer.
+'''
+# `logoFile` is deprecated in this NeoForge version; `iconFile` is the square-icon replacement.
+iconFile = "assets/clientcommands/icon.png"
+
+# NeoForge requires a mod's mixin configs to be declared explicitly; Fabric discovered them by
+# convention from the jar's `fabric.mod.json`. Without this block the 79 mixin classes ship in the
+# jar but are never handed to the Mixin subsystem, and the mod silently loads with none of its hooks
+# applied.
+[[mixins]]
+config = "mixins.clientcommands.json"
+
+# The embedded xpple libraries are Fabric mods: their mixin configs were normally discovered from
+# their own fabric.mod.json, which is excluded here because NeoForge cannot read it. Their configs
+# are merged into this jar (see unpackGameContent) and so must be declared explicitly, or the
+# libraries load without their mixins ever being applied.
+[[mixins]]
+config = "betterconfig.mixins.json"
+
+[[mixins]]
+config = "betterconfig.mixins.client.json"
+
+[[mixins]]
+config = "mixins.simplewaypoints.json"
+
+[[dependencies.clientcommands]]
+modId = "neoforge"
+type = "required"
+versionRange = "[26.3.0,)"
+ordering = "NONE"
+side = "CLIENT"
+
+[[dependencies.clientcommands]]
+modId = "minecraft"
+type = "required"
+versionRange = "[${mcversion}]"
+ordering = "NONE"
+side = "CLIENT"
